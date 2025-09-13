@@ -16,6 +16,15 @@ A Node.js application that automatically synchronizes inventory levels across Sh
 - A Shopify store with Admin API access
 - Shopify webhook configured for inventory level updates
 
+### Required Shopify API Permissions
+
+When creating your Admin API access token, ensure it has the following permissions:
+
+- `read_inventory`: Required to query inventory items and their SKUs
+- `write_inventory`: Required to update inventory levels
+- `read_products`: Required to query product variants and their SKUs
+- `read_locations`: Required to handle location-based inventory updates
+
 ## ⚙️ Environment Variables
 
 Create a `.env` file in the root directory with the following variables:
