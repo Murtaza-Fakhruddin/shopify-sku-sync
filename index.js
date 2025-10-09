@@ -52,10 +52,11 @@ async function shopifyGraphQL(query, variables = {}) {
     `${apiBase}/graphql.json`,
     { query, variables },
     {
-      headers: {
-        'X-Shopify-Access-Token': TOKEN,
-        'Content-Type': 'application/json'
-      }
+      headers:
+        {
+          'X-Shopify-Access-Token': TOKEN,
+          'Content-Type': 'application/json'
+        }
     }
   );
   if (res.data.errors) {
@@ -189,6 +190,120 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     return res.status(200).send('Bulk sync complete');
   } catch (err) {
     console.error('Error in webhook handler', err.response?.data || err.message);
+    return res.status(500).send('Internal error');
+  }
+});
+
+// --- Order webhook handler: sync all matching SKUs on order creation ---
+app.post('/webhooks/orders/create', async (req, res) => {
+  try {
+    if (!verifyWebhook(req)) {
+      console.warn('Order webhook verification failed');
+      return res.status(401).send('Webhook verification failed');
+    }
+
+    const order = req.body;
+    if (!order || !order.line_items) {
+      return res.status(400).send('Invalid order payload');
+    }
+
+    // For each line item, sync all matching SKUs
+    for (const item of order.line_items) {
+      const sku = item.sku;
+      const quantity = item.quantity;
+      const location_id = order.location_id || (order.fulfillments && order.fulfillments[0]?.location_id);
+      if (!sku || !location_id) continue;
+
+      // Find all variants with this SKU
+      const variants = await findVariantsBySKU(sku);
+      if (!variants || variants.length <= 1) continue;
+
+      // Get the current available quantity for the triggering item (from Shopify)
+      // We'll use the first variant's inventory item id
+      const inventory_item_id = variants[0].inventory_item_id.split('/').pop();
+      // Optionally, you could fetch the latest available quantity here
+
+      // Build input for GraphQL mutation: reduce quantity for all except the triggering item
+      const formattedUpdates = variants.map(v => ({
+        inventoryItemId: v.inventory_item_id,
+        locationId: `gid://shopify/Location/${location_id}`,
+        // This will just decrement by the order quantity
+        availableDelta: -Math.abs(quantity)
+      }));
+
+      const mutation = `
+        mutation adjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            inventoryAdjustmentGroup { createdAt }
+            userErrors { field message }
+          }
+        }
+      `;
+      const input = { reason: "sale", adjustQuantities: formattedUpdates };
+      const result = await shopifyGraphQL(mutation, { input });
+      if (result.inventoryAdjustQuantities.userErrors.length > 0) {
+        console.error('Order sync errors:', result.inventoryAdjustQuantities.userErrors);
+      } else {
+        console.log(`Order sync: decremented ${variants.length} variants for SKU ${sku}`);
+      }
+    }
+    return res.status(200).send('Order SKU sync complete');
+  } catch (err) {
+    console.error('Error in order webhook handler', err.response?.data || err.message);
+    return res.status(500).send('Internal error');
+  }
+});
+
+// --- Order cancellation/return webhook handler: restore inventory for all matching SKUs ---
+app.post('/webhooks/orders/cancelled', async (req, res) => {
+  try {
+    if (!verifyWebhook(req)) {
+      console.warn('Order cancelled webhook verification failed');
+      return res.status(401).send('Webhook verification failed');
+    }
+
+    const order = req.body;
+    if (!order || !order.line_items) {
+      return res.status(400).send('Invalid order payload');
+    }
+
+    // For each line item, restore inventory for all matching SKUs
+    for (const item of order.line_items) {
+      const sku = item.sku;
+      const quantity = item.quantity;
+      const location_id = order.location_id || (order.fulfillments && order.fulfillments[0]?.location_id);
+      if (!sku || !location_id) continue;
+
+      // Find all variants with this SKU
+      const variants = await findVariantsBySKU(sku);
+      if (!variants || variants.length <= 1) continue;
+
+      // Build input for GraphQL mutation: increment quantity for all variants
+      const formattedUpdates = variants.map(v => ({
+        inventoryItemId: v.inventory_item_id,
+        locationId: `gid://shopify/Location/${location_id}`,
+        availableDelta: Math.abs(quantity)
+      }));
+
+      const mutation = `
+        mutation adjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            inventoryAdjustmentGroup { createdAt }
+            userErrors { field message }
+          }
+        }
+      `;
+      const input = { reason: "return_or_cancel", adjustQuantities: formattedUpdates };
+      const result = await shopifyGraphQL(mutation, { input });
+      if (result.inventoryAdjustQuantities.userErrors.length > 0) {
+        console.error('Cancel/return sync errors:', result.inventoryAdjustQuantities.userErrors);
+      } else {
+        console.log(`Cancel/return sync: incremented ${variants.length} variants for SKU ${sku}`);
+      }
+    }
+    return res.status(200).send('Order cancel/return SKU sync complete');
+  } catch (err) {
+    console.error('Error in order cancel/return webhook handler', err.response?.data || err.message);
     return res.status(500).send('Internal error');
   }
 });
