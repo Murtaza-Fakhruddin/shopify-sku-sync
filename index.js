@@ -146,16 +146,38 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No other variants with same SKU');
     }
 
-    // Build input for GraphQL mutation
-    const formattedUpdates = variants
-      .filter(v => v.inventory_item_id.split('/').pop() !== String(inventory_item_id))
-      .map(v => ({
-        inventoryItemId: v.inventory_item_id,
-        locationId: `gid://shopify/Location/${location_id}`,
-        quantity: available
-      }));
+    // Fetch current inventory for all variants (except the triggering one)
+    const getLevelQuery = `
+      query($id: ID!, $locationId: ID!) {
+        inventoryLevel(inventoryItemId: $id, locationId: $locationId) {
+          available
+        }
+      }
+    `;
+    const locationGid = `gid://shopify/Location/${location_id}`;
+    const updates = [];
+    for (const v of variants) {
+      const vId = v.inventory_item_id.split('/').pop();
+      if (vId === String(inventory_item_id)) continue;
+      // Get current available for this variant at this location
+      let currentAvailable = null;
+      try {
+        const data = await shopifyGraphQL(getLevelQuery, { id: v.inventory_item_id, locationId: locationGid });
+        currentAvailable = data.inventoryLevel?.available;
+      } catch (e) {
+        console.warn(`Could not fetch inventory for ${v.inventory_item_id} at ${location_id}`);
+        continue;
+      }
+      if (currentAvailable !== available) {
+        updates.push({
+          inventoryItemId: v.inventory_item_id,
+          locationId: locationGid,
+          quantity: available
+        });
+      }
+    }
 
-    if (formattedUpdates.length === 0) {
+    if (updates.length === 0) {
       return res.status(200).send('Nothing to update');
     }
 
@@ -173,8 +195,7 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       }
     `;
 
-    const input = { reason: "correction", setQuantities: formattedUpdates };
-
+    const input = { reason: "correction", setQuantities: updates };
 
     const result = await shopifyGraphQL(mutation, { input });
 
@@ -184,7 +205,7 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
         result.inventorySetOnHandQuantities.userErrors
       );
     } else {
-      console.log(`Synced ${formattedUpdates.length} variants for SKU ${sku}`);
+      console.log(`Synced ${updates.length} variants for SKU ${sku}`);
     }
 
     return res.status(200).send('Bulk sync complete');
