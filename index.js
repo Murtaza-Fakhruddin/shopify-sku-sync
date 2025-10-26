@@ -148,26 +148,40 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
 
     // Fetch current inventory for all variants (except the triggering one)
     const getLevelQuery = `
-      query($id: ID!, $locationId: ID!) {
-        inventoryLevel(inventoryItemId: $id, locationId: $locationId) {
-          available
+      query($inventoryItemId: ID!, $locationId: ID!) {
+        inventoryLevel(inventoryItemId: $inventoryItemId, locationId: $locationId) {
+          quantities(first: 1) {
+            edges {
+              node {
+                available
+              }
+            }
+          }
         }
       }
     `;
+    
     const locationGid = `gid://shopify/Location/${location_id}`;
     const updates = [];
+    
     for (const v of variants) {
       const vId = v.inventory_item_id.split('/').pop();
       if (vId === String(inventory_item_id)) continue;
+      
       // Get current available for this variant at this location
       let currentAvailable = null;
       try {
-        const data = await shopifyGraphQL(getLevelQuery, { id: v.inventory_item_id, locationId: locationGid });
-        currentAvailable = data.inventoryLevel?.available;
+        const data = await shopifyGraphQL(getLevelQuery, { 
+          inventoryItemId: v.inventory_item_id,
+          locationId: locationGid 
+        });
+        currentAvailable = data.inventoryLevel?.quantities?.edges?.[0]?.node?.available;
       } catch (e) {
-        console.warn(`Could not fetch inventory for ${v.inventory_item_id} at ${location_id}`);
+        console.warn(`Could not fetch inventory for ${v.inventory_item_id} at ${location_id}`, e.message);
         continue;
       }
+      
+      // Only update if the quantities don't match
       if (currentAvailable !== available) {
         updates.push({
           inventoryItemId: v.inventory_item_id,
