@@ -30,31 +30,53 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const syncTracker = {
   operations: new Map(),
   batchSize: 50,  // Max number of variants to update in one batch
-  timeout: 10000,  // 10 seconds timeout (increased for Render)
+  timeout: 30000,  // 30 seconds timeout (increased for Render)
   
   // Check if an operation is part of recent sync
   isRecentSync(sku, locationId, quantity) {
-    const key = `${sku}:${locationId}:${quantity}`;
+    // Check for exact quantity match
+    const exactKey = `${sku}:${locationId}:${quantity}`;
     const now = Date.now();
-    const syncInfo = this.operations.get(key);
+    const exactSyncInfo = this.operations.get(exactKey);
     
-    if (syncInfo && (now - syncInfo.timestamp) < this.timeout) {
+    if (exactSyncInfo && (now - exactSyncInfo.timestamp) < this.timeout) {
       return true;
     }
+
+    // Also check if there's any recent sync for this SKU/location within ±2 quantity
+    // This helps catch nearly simultaneous updates
+    for (let q = quantity - 2; q <= quantity + 2; q++) {
+      const nearbyKey = `${sku}:${locationId}:${q}`;
+      const nearbySyncInfo = this.operations.get(nearbyKey);
+      
+      if (nearbySyncInfo && (now - nearbySyncInfo.timestamp) < 5000) { // 5 second window for nearby quantities
+        console.log(`Found nearby sync for quantity ${q}, current: ${quantity}`);
+        return true;
+      }
+    }
+    
     return false;
   },
 
-  // Mark operation as synced
+  // Mark operation as synced with enhanced tracking
   markSync(sku, locationId, quantity, variantIds) {
     const key = `${sku}:${locationId}:${quantity}`;
+    const timestamp = Date.now();
+    
     this.operations.set(key, {
-      timestamp: Date.now(),
-      variantIds: new Set(variantIds)
+      timestamp,
+      variantIds: new Set(variantIds),
+      originalQuantity: quantity
     });
+
+    console.log(`Marked sync: SKU=${sku}, location=${locationId}, quantity=${quantity}, timestamp=${timestamp}`);
 
     // Cleanup after timeout
     setTimeout(() => {
-      this.operations.delete(key);
+      if (this.operations.has(key)) {
+        console.log(`Cleaning up sync record for ${key}`);
+        this.operations.delete(key);
+      }
     }, this.timeout);
   }
 };
@@ -180,17 +202,28 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No SKU; nothing to sync');
     }
 
+    // Add a small random delay to help prevent race conditions
+    await new Promise(resolve => setTimeout(resolve, Math.random() * 1000));
+
     // Enhanced logging for sync tracking
     const isSynced = syncTracker.isRecentSync(sku, location_id, available);
     console.log(`[${triggerTime}] Sync check for SKU ${sku}:`, {
       location: location_id,
       quantity: available,
-      isRecentSync: isSynced
+      isRecentSync: isSynced,
+      webhookTimestamp: req.headers['x-shopify-webhook-timestamp']
     });
 
     if (isSynced) {
-      console.log('Skipping webhook - part of recent sync operation');
+      console.log(`[${triggerTime}] Skipping webhook - part of recent sync operation for SKU ${sku}`);
       return res.status(200).send('Skipped - part of batch update');
+    }
+
+    // Double-check current quantity hasn't changed
+    const currentState = await getInventoryItem(inventory_item_id);
+    if (currentState && currentState.available !== available) {
+      console.log(`[${triggerTime}] Quantity changed while processing (${available} → ${currentState.available})`);
+      return res.status(200).send('Quantity changed while processing');
     }
 
     console.log('Trigger SKU:', sku);
