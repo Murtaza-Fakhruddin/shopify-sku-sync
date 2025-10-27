@@ -26,11 +26,12 @@ const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// Enhanced sync prevention with debouncing and batch tracking
+// Enhanced sync prevention with debouncing, batch tracking, and request queue
 const syncTracker = {
   operations: new Map(),
   batchSize: 50,  // Max number of variants to update in one batch
-  timeout: 10000,  // 10 seconds timeout (increased for Render)
+  timeout: 30000,  // 30 seconds timeout for Render's environment
+  processingQueue: new Map(), // Tracks currently processing SKUs
   
   // Check if an operation is part of recent sync
   isRecentSync(sku, locationId, quantity) {
@@ -39,9 +40,26 @@ const syncTracker = {
     const syncInfo = this.operations.get(key);
     
     if (syncInfo && (now - syncInfo.timestamp) < this.timeout) {
+      console.log(`Skipping duplicate sync for SKU ${sku} - Last sync was ${(now - syncInfo.timestamp)/1000}s ago`);
       return true;
     }
     return false;
+  },
+
+  // Check if SKU is currently being processed
+  async acquireLock(sku) {
+    if (this.processingQueue.has(sku)) {
+      console.log(`SKU ${sku} is already being processed, waiting...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return false;
+    }
+    this.processingQueue.set(sku, Date.now());
+    return true;
+  },
+
+  // Release SKU lock
+  releaseLock(sku) {
+    this.processingQueue.delete(sku);
   },
 
   // Mark operation as synced
@@ -56,6 +74,8 @@ const syncTracker = {
     setTimeout(() => {
       this.operations.delete(key);
     }, this.timeout);
+
+    console.log(`Marked sync complete for SKU ${sku} with ${variantIds.length} variants`);
   }
 };
 
@@ -156,16 +176,19 @@ async function getInventoryItem(inventory_item_id) {
 // --- Webhook handler ---
 app.post('/webhooks/inventory_levels/update', async (req, res) => {
   try {
+    const webhookId = crypto.randomUUID();
+    console.log(`[${webhookId}] Processing new webhook request`);
+
     if (!verifyWebhook(req)) {
-      console.warn('Webhook verification failed');
+      console.warn(`[${webhookId}] Webhook verification failed`);
       return res.status(401).send('Webhook verification failed');
     }
 
     const { inventory_item_id, location_id, available } = req.body;
-    console.log('Incoming webhook:', { inventory_item_id, location_id, available });
+    console.log(`[${webhookId}] Incoming webhook:`, { inventory_item_id, location_id, available });
 
     if (!inventory_item_id || !location_id || typeof available === 'undefined') {
-      console.warn('Webhook payload missing required fields');
+      console.warn(`[${webhookId}] Webhook payload missing required fields`);
       return res.status(400).send('Bad payload');
     }
 
@@ -174,14 +197,25 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     const sku = inventoryItem && inventoryItem.sku;
     
     if (!sku) {
-      console.warn('No SKU found for inventory_item_id', inventory_item_id);
+      console.warn(`[${webhookId}] No SKU found for inventory_item_id`, inventory_item_id);
       return res.status(200).send('No SKU; nothing to sync');
     }
 
     // Check if this update is part of a recent sync operation
     if (syncTracker.isRecentSync(sku, location_id, available)) {
-      console.log('Skipping webhook - part of recent sync operation');
+      console.log(`[${webhookId}] Skipping webhook - part of recent sync operation`);
       return res.status(200).send('Skipped - part of batch update');
+    }
+
+    // Try to acquire lock for this SKU
+    let lockAcquired = false;
+    for (let i = 0; i < 3; i++) { // Try 3 times to acquire lock
+      lockAcquired = await syncTracker.acquireLock(sku);
+      if (lockAcquired) break;
+      if (i === 2) {
+        console.log(`[${webhookId}] Failed to acquire lock for SKU ${sku} after 3 attempts`);
+        return res.status(429).send('SKU update in progress, please retry');
+      }
     }
 
     console.log('Trigger SKU:', sku);
@@ -240,13 +274,18 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
         updates.map(u => u.inventoryItemId)
       );
 
-      console.log(`Synced ${updates.length} variants for SKU ${sku}`);
+      console.log(`[${webhookId}] Synced ${updates.length} variants for SKU ${sku}`);
     }
 
     return res.status(200).send('Bulk sync complete');
   } catch (err) {
-    console.error('Error in webhook handler', err.response?.data || err.message);
+    console.error(`[${webhookId}] Error in webhook handler`, err.response?.data || err.message);
     return res.status(500).send('Internal error');
+  } finally {
+    if (lockAcquired) {
+      syncTracker.releaseLock(sku);
+      console.log(`[${webhookId}] Released lock for SKU ${sku}`);
+    }
   }
 });
 
