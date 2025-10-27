@@ -169,7 +169,7 @@ async function getInventoryItem(inventory_item_id, location_id = null) {
           id
           sku
           inventoryLevel(locationId: $locationId) {
-            available
+            availableQuantity
           }
         }
       }
@@ -198,7 +198,7 @@ async function getInventoryItem(inventory_item_id, location_id = null) {
     }
     return {
       ...data.inventoryItem,
-      available: location_id ? data.inventoryItem.inventoryLevel?.available : undefined
+      available: location_id ? data.inventoryItem.inventoryLevel?.availableQuantity : undefined
     };
   } catch (error) {
     console.error('Error fetching inventory item:', error.message);
