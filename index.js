@@ -161,28 +161,49 @@ async function findVariantsBySKU(sku) {
 
 // --- Get inventory item details with quantity ---
 async function getInventoryItem(inventory_item_id, location_id = null) {
-  const query = `
-    query($id: ID!, $locationId: ID) {
-      inventoryItem(id: $id) {
-        id
-        sku
-        ${location_id ? `inventoryLevel(locationId: $locationId) {
-          available
-        }` : ''}
+  let query;
+  if (location_id) {
+    query = `
+      query getInventoryWithLevel($id: ID!, $locationId: ID!) {
+        inventoryItem(id: $id) {
+          id
+          sku
+          inventoryLevel(locationId: $locationId) {
+            available
+          }
+        }
       }
-    }
-  `;
+    `;
+  } else {
+    query = `
+      query getInventory($id: ID!) {
+        inventoryItem(id: $id) {
+          id
+          sku
+        }
+      }
+    `;
+  }
   
   const variables = {
     id: `gid://shopify/InventoryItem/${inventory_item_id}`,
     ...(location_id ? { locationId: `gid://shopify/Location/${location_id}` } : {})
   };
 
-  const data = await shopifyGraphQL(query, variables);
-  return {
-    ...data.inventoryItem,
-    available: location_id ? data.inventoryItem?.inventoryLevel?.available : undefined
-  };
+  try {
+    const data = await shopifyGraphQL(query, variables);
+    if (!data.inventoryItem) {
+      console.log('No inventory item found:', { inventory_item_id, location_id });
+      return null;
+    }
+    return {
+      ...data.inventoryItem,
+      available: location_id ? data.inventoryItem.inventoryLevel?.available : undefined
+    };
+  } catch (error) {
+    console.error('Error fetching inventory item:', error.message);
+    return null;
+  }
 }
 
 // --- Webhook handler ---
