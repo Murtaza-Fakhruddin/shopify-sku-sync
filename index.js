@@ -26,6 +26,10 @@ const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
+// Store recent syncs to prevent loops
+const recentSyncs = new Map();
+const SYNC_TIMEOUT = 5000; // 5 seconds
+
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.error(
     'Missing required env variables: SHOPIFY_SHOP, SHOPIFY_ADMIN_API_ACCESS_TOKEN, WEBHOOK_SECRET'
@@ -48,22 +52,30 @@ function verifyWebhook(req) {
 
 // --- Shopify GraphQL helper ---
 async function shopifyGraphQL(query, variables = {}) {
-  const res = await axios.post(
-    `${apiBase}/graphql.json`,
-    { query, variables },
-    {
-      headers:
-        {
-          'X-Shopify-Access-Token': TOKEN,
-          'Content-Type': 'application/json'
-        }
+  try {
+    const response = await axios.post(`${apiBase}/graphql.json`, {
+      query,
+      variables
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': TOKEN
+      }
+    });
+
+    if (response.data.errors) {
+      console.error('GraphQL Errors:', JSON.stringify(response.data.errors, null, 2));
+      throw new Error('GraphQL query failed');
     }
-  );
-  if (res.data.errors) {
-    console.error('GraphQL errors:', res.data.errors);
-    throw new Error('GraphQL query failed');
+
+    return response.data.data;
+  } catch (error) {
+    console.error('GraphQL Error:', error.message);
+    if (error.response?.data?.errors) {
+      console.error('API Errors:', JSON.stringify(error.response.data.errors, null, 2));
+    }
+    throw error;
   }
-  return res.data.data;
 }
 
 // --- Find variants by SKU ---
@@ -123,8 +135,18 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     const { inventory_item_id, location_id, available } = req.body;
     console.log('Incoming webhook:', { inventory_item_id, location_id, available });
 
-    if (!inventory_item_id || typeof available === 'undefined') {
-      console.warn('Webhook payload missing inventory_item_id or available');
+    // Check if this is part of a recent sync operation
+    const syncKey = `${location_id}-${available}`;
+    if (recentSyncs.has(syncKey)) {
+      const syncInfo = recentSyncs.get(syncKey);
+      if (Date.now() - syncInfo.timestamp < SYNC_TIMEOUT) {
+        console.log('Skipping webhook - part of recent sync operation');
+        return res.status(200).send('Skipped - part of batch update');
+      }
+    }
+
+    if (!inventory_item_id || !location_id || typeof available === 'undefined') {
+      console.warn('Webhook payload missing required fields');
       return res.status(400).send('Bad payload');
     }
 
@@ -146,50 +168,15 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No other variants with same SKU');
     }
 
-    // Fetch current inventory for all variants (except the triggering one)
-    const getLevelQuery = `
-      query($inventoryItemId: ID!, $locationId: ID!) {
-        inventoryLevel(inventoryItemId: $inventoryItemId, locationId: $locationId) {
-          quantities(first: 1) {
-            edges {
-              node {
-                available
-              }
-            }
-          }
-        }
-      }
-    `;
-    
+    // Build input for GraphQL mutation
     const locationGid = `gid://shopify/Location/${location_id}`;
-    const updates = [];
-    
-    for (const v of variants) {
-      const vId = v.inventory_item_id.split('/').pop();
-      if (vId === String(inventory_item_id)) continue;
-      
-      // Get current available for this variant at this location
-      let currentAvailable = null;
-      try {
-        const data = await shopifyGraphQL(getLevelQuery, { 
-          inventoryItemId: v.inventory_item_id,
-          locationId: locationGid 
-        });
-        currentAvailable = data.inventoryLevel?.quantities?.edges?.[0]?.node?.available;
-      } catch (e) {
-        console.warn(`Could not fetch inventory for ${v.inventory_item_id} at ${location_id}`, e.message);
-        continue;
-      }
-      
-      // Only update if the quantities don't match
-      if (currentAvailable !== available) {
-        updates.push({
-          inventoryItemId: v.inventory_item_id,
-          locationId: locationGid,
-          quantity: available
-        });
-      }
-    }
+    const updates = variants
+      .filter(v => v.inventory_item_id.split('/').pop() !== String(inventory_item_id))
+      .map(v => ({
+        inventoryItemId: v.inventory_item_id,
+        locationId: locationGid,
+        quantity: available
+      }));
 
     if (updates.length === 0) {
       return res.status(200).send('Nothing to update');
@@ -219,6 +206,18 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
         result.inventorySetOnHandQuantities.userErrors
       );
     } else {
+      // Record this sync operation to prevent loops
+      recentSyncs.set(syncKey, {
+        timestamp: Date.now(),
+        sku,
+        variants: updates.map(u => u.inventoryItemId)
+      });
+      
+      // Clean up old sync records after timeout
+      setTimeout(() => {
+        recentSyncs.delete(syncKey);
+      }, SYNC_TIMEOUT);
+
       console.log(`Synced ${updates.length} variants for SKU ${sku}`);
     }
 
