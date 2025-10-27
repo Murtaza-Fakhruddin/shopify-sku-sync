@@ -26,9 +26,38 @@ const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
 const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// Store recent syncs to prevent loops
-const recentSyncs = new Map();
-const SYNC_TIMEOUT = 5000; // 5 seconds
+// Enhanced sync prevention with debouncing and batch tracking
+const syncTracker = {
+  operations: new Map(),
+  batchSize: 50,  // Max number of variants to update in one batch
+  timeout: 10000,  // 10 seconds timeout (increased for Render)
+  
+  // Check if an operation is part of recent sync
+  isRecentSync(sku, locationId, quantity) {
+    const key = `${sku}:${locationId}:${quantity}`;
+    const now = Date.now();
+    const syncInfo = this.operations.get(key);
+    
+    if (syncInfo && (now - syncInfo.timestamp) < this.timeout) {
+      return true;
+    }
+    return false;
+  },
+
+  // Mark operation as synced
+  markSync(sku, locationId, quantity, variantIds) {
+    const key = `${sku}:${locationId}:${quantity}`;
+    this.operations.set(key, {
+      timestamp: Date.now(),
+      variantIds: new Set(variantIds)
+    });
+
+    // Cleanup after timeout
+    setTimeout(() => {
+      this.operations.delete(key);
+    }, this.timeout);
+  }
+};
 
 if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
   console.error(
@@ -135,16 +164,6 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     const { inventory_item_id, location_id, available } = req.body;
     console.log('Incoming webhook:', { inventory_item_id, location_id, available });
 
-    // Check if this is part of a recent sync operation
-    const syncKey = `${location_id}-${available}`;
-    if (recentSyncs.has(syncKey)) {
-      const syncInfo = recentSyncs.get(syncKey);
-      if (Date.now() - syncInfo.timestamp < SYNC_TIMEOUT) {
-        console.log('Skipping webhook - part of recent sync operation');
-        return res.status(200).send('Skipped - part of batch update');
-      }
-    }
-
     if (!inventory_item_id || !location_id || typeof available === 'undefined') {
       console.warn('Webhook payload missing required fields');
       return res.status(400).send('Bad payload');
@@ -153,9 +172,16 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     // Get triggering item → extract SKU
     const inventoryItem = await getInventoryItem(inventory_item_id);
     const sku = inventoryItem && inventoryItem.sku;
+    
     if (!sku) {
       console.warn('No SKU found for inventory_item_id', inventory_item_id);
       return res.status(200).send('No SKU; nothing to sync');
+    }
+
+    // Check if this update is part of a recent sync operation
+    if (syncTracker.isRecentSync(sku, location_id, available)) {
+      console.log('Skipping webhook - part of recent sync operation');
+      return res.status(200).send('Skipped - part of batch update');
     }
 
     console.log('Trigger SKU:', sku);
@@ -207,16 +233,12 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       );
     } else {
       // Record this sync operation to prevent loops
-      recentSyncs.set(syncKey, {
-        timestamp: Date.now(),
+      syncTracker.markSync(
         sku,
-        variants: updates.map(u => u.inventoryItemId)
-      });
-      
-      // Clean up old sync records after timeout
-      setTimeout(() => {
-        recentSyncs.delete(syncKey);
-      }, SYNC_TIMEOUT);
+        location_id,
+        available,
+        updates.map(u => u.inventoryItemId)
+      );
 
       console.log(`Synced ${updates.length} variants for SKU ${sku}`);
     }
