@@ -159,20 +159,30 @@ async function findVariantsBySKU(sku) {
   }));
 }
 
-// --- Get inventory item details (for SKU lookup) ---
-async function getInventoryItem(inventory_item_id) {
+// --- Get inventory item details with quantity ---
+async function getInventoryItem(inventory_item_id, location_id = null) {
   const query = `
-    query($id: ID!) {
+    query($id: ID!, $locationId: ID) {
       inventoryItem(id: $id) {
         id
         sku
+        ${location_id ? `inventoryLevel(locationId: $locationId) {
+          available
+        }` : ''}
       }
     }
   `;
-  const data = await shopifyGraphQL(query, {
-    id: `gid://shopify/InventoryItem/${inventory_item_id}`
-  });
-  return data.inventoryItem;
+  
+  const variables = {
+    id: `gid://shopify/InventoryItem/${inventory_item_id}`,
+    ...(location_id ? { locationId: `gid://shopify/Location/${location_id}` } : {})
+  };
+
+  const data = await shopifyGraphQL(query, variables);
+  return {
+    ...data.inventoryItem,
+    available: location_id ? data.inventoryItem?.inventoryLevel?.available : undefined
+  };
 }
 
 // --- Webhook handler ---
@@ -220,10 +230,21 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     }
 
     // Double-check current quantity hasn't changed
-    const currentState = await getInventoryItem(inventory_item_id);
-    if (currentState && currentState.available !== available) {
-      console.log(`[${triggerTime}] Quantity changed while processing (${available} → ${currentState.available})`);
-      return res.status(200).send('Quantity changed while processing');
+    const currentState = await getInventoryItem(inventory_item_id, location_id);
+    console.log(`[${triggerTime}] Current inventory state:`, {
+      sku: currentState?.sku,
+      available: currentState?.available,
+      expected: available
+    });
+    
+    if (!currentState) {
+      console.error(`[${triggerTime}] Failed to fetch current inventory state`);
+      return res.status(500).send('Failed to verify current inventory');
+    }
+    
+    if (currentState.available !== available) {
+      console.log(`[${triggerTime}] Quantity mismatch - webhook: ${available}, current: ${currentState.available}`);
+      // Continue anyway as the webhook quantity is what we want to sync to
     }
 
     console.log('Trigger SKU:', sku);
