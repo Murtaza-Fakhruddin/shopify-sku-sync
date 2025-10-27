@@ -30,53 +30,31 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 const syncTracker = {
   operations: new Map(),
   batchSize: 50,  // Max number of variants to update in one batch
-  timeout: 30000,  // 30 seconds timeout (increased for Render)
+  timeout: 10000,  // 10 seconds timeout (increased for Render)
   
   // Check if an operation is part of recent sync
   isRecentSync(sku, locationId, quantity) {
-    // Check for exact quantity match
-    const exactKey = `${sku}:${locationId}:${quantity}`;
+    const key = `${sku}:${locationId}:${quantity}`;
     const now = Date.now();
-    const exactSyncInfo = this.operations.get(exactKey);
+    const syncInfo = this.operations.get(key);
     
-    if (exactSyncInfo && (now - exactSyncInfo.timestamp) < this.timeout) {
+    if (syncInfo && (now - syncInfo.timestamp) < this.timeout) {
       return true;
     }
-
-    // Also check if there's any recent sync for this SKU/location within ±2 quantity
-    // This helps catch nearly simultaneous updates
-    for (let q = quantity - 2; q <= quantity + 2; q++) {
-      const nearbyKey = `${sku}:${locationId}:${q}`;
-      const nearbySyncInfo = this.operations.get(nearbyKey);
-      
-      if (nearbySyncInfo && (now - nearbySyncInfo.timestamp) < 5000) { // 5 second window for nearby quantities
-        console.log(`Found nearby sync for quantity ${q}, current: ${quantity}`);
-        return true;
-      }
-    }
-    
     return false;
   },
 
-  // Mark operation as synced with enhanced tracking
+  // Mark operation as synced
   markSync(sku, locationId, quantity, variantIds) {
     const key = `${sku}:${locationId}:${quantity}`;
-    const timestamp = Date.now();
-    
     this.operations.set(key, {
-      timestamp,
-      variantIds: new Set(variantIds),
-      originalQuantity: quantity
+      timestamp: Date.now(),
+      variantIds: new Set(variantIds)
     });
-
-    console.log(`Marked sync: SKU=${sku}, location=${locationId}, quantity=${quantity}, timestamp=${timestamp}`);
 
     // Cleanup after timeout
     setTimeout(() => {
-      if (this.operations.has(key)) {
-        console.log(`Cleaning up sync record for ${key}`);
-        this.operations.delete(key);
-      }
+      this.operations.delete(key);
     }, this.timeout);
   }
 };
@@ -159,51 +137,20 @@ async function findVariantsBySKU(sku) {
   }));
 }
 
-// --- Get inventory item details with quantity ---
-async function getInventoryItem(inventory_item_id, location_id = null) {
-  let query;
-  if (location_id) {
-    query = `
-      query getInventoryWithLevel($id: ID!, $locationId: ID!) {
-        inventoryItem(id: $id) {
-          id
-          sku
-          inventoryLevel(locationId: $locationId) {
-            quantity
-          }
-        }
+// --- Get inventory item details (for SKU lookup) ---
+async function getInventoryItem(inventory_item_id) {
+  const query = `
+    query($id: ID!) {
+      inventoryItem(id: $id) {
+        id
+        sku
       }
-    `;
-  } else {
-    query = `
-      query getInventory($id: ID!) {
-        inventoryItem(id: $id) {
-          id
-          sku
-        }
-      }
-    `;
-  }
-  
-  const variables = {
-    id: `gid://shopify/InventoryItem/${inventory_item_id}`,
-    ...(location_id ? { locationId: `gid://shopify/Location/${location_id}` } : {})
-  };
-
-  try {
-    const data = await shopifyGraphQL(query, variables);
-    if (!data.inventoryItem) {
-      console.log('No inventory item found:', { inventory_item_id, location_id });
-      return null;
     }
-    return {
-      ...data.inventoryItem,
-      available: location_id ? data.inventoryItem.inventoryLevel?.quantity : undefined
-    };
-  } catch (error) {
-    console.error('Error fetching inventory item:', error.message);
-    return null;
-  }
+  `;
+  const data = await shopifyGraphQL(query, {
+    id: `gid://shopify/InventoryItem/${inventory_item_id}`
+  });
+  return data.inventoryItem;
 }
 
 // --- Webhook handler ---
@@ -215,13 +162,11 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     }
 
     const { inventory_item_id, location_id, available } = req.body;
-    const triggerTime = new Date().toISOString();
-    console.log(`[${triggerTime}] Incoming webhook:`, { inventory_item_id, location_id, available });
+    console.log('Incoming webhook:', { inventory_item_id, location_id, available });
 
-    // Validate inventory_item_id format and available is a number
-    if (!inventory_item_id || !location_id || typeof available !== 'number') {
-      console.warn('Webhook payload invalid. Expected number for available:', { inventory_item_id, location_id, available });
-      return res.status(400).send('Bad payload - invalid quantity type');
+    if (!inventory_item_id || !location_id || typeof available === 'undefined') {
+      console.warn('Webhook payload missing required fields');
+      return res.status(400).send('Bad payload');
     }
 
     // Get triggering item → extract SKU
@@ -233,71 +178,30 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No SKU; nothing to sync');
     }
 
-    // Add a small random delay to help prevent race conditions
-    await new Promise(resolve => setTimeout(resolve, Math.random() * 1000));
-
-    // Enhanced logging for sync tracking
-    const isSynced = syncTracker.isRecentSync(sku, location_id, available);
-    console.log(`[${triggerTime}] Sync check for SKU ${sku}:`, {
-      location: location_id,
-      quantity: available,
-      isRecentSync: isSynced,
-      webhookTimestamp: req.headers['x-shopify-webhook-timestamp']
-    });
-
-    if (isSynced) {
-      console.log(`[${triggerTime}] Skipping webhook - part of recent sync operation for SKU ${sku}`);
+    // Check if this update is part of a recent sync operation
+    if (syncTracker.isRecentSync(sku, location_id, available)) {
+      console.log('Skipping webhook - part of recent sync operation');
       return res.status(200).send('Skipped - part of batch update');
-    }
-
-    // Double-check current quantity hasn't changed
-    const currentState = await getInventoryItem(inventory_item_id, location_id);
-    console.log(`[${triggerTime}] Current inventory state:`, {
-      sku: currentState?.sku,
-      available: currentState?.available,
-      expected: available
-    });
-    
-    if (!currentState) {
-      console.error(`[${triggerTime}] Failed to fetch current inventory state`);
-      return res.status(500).send('Failed to verify current inventory');
-    }
-    
-    if (currentState.available !== available) {
-      console.log(`[${triggerTime}] Quantity mismatch - webhook: ${available}, current: ${currentState.available}`);
-      // Continue anyway as the webhook quantity is what we want to sync to
     }
 
     console.log('Trigger SKU:', sku);
 
     // Find all variants with this SKU
     const variants = await findVariantsBySKU(sku);
-    console.log(`[${triggerTime}] Found ${variants.length} variants for SKU ${sku}`);
+    console.log(`Found ${variants.length} variants for SKU ${sku}`);
 
     if (!variants || variants.length <= 1) {
       return res.status(200).send('No other variants with same SKU');
     }
 
-    // Double check the available quantity is still correct
-    const triggerVariant = await getInventoryItem(inventory_item_id);
-    if (!triggerVariant) {
-      console.error('Could not verify trigger variant quantity');
-      return res.status(500).send('Failed to verify quantity');
-    }
-
     // Build input for GraphQL mutation
     const locationGid = `gid://shopify/Location/${location_id}`;
     const updates = variants
-      .filter(v => {
-        const variantId = v.inventory_item_id.split('/').pop();
-        const isTriggering = variantId === String(inventory_item_id);
-        console.log(`[${triggerTime}] Variant ${variantId}: ${isTriggering ? 'triggering' : 'to update'}`);
-        return !isTriggering;
-      })
+      .filter(v => v.inventory_item_id.split('/').pop() !== String(inventory_item_id))
       .map(v => ({
         inventoryItemId: v.inventory_item_id,
         locationId: locationGid,
-        quantity: Math.round(available) // Ensure whole number
+        quantity: available
       }));
 
     if (updates.length === 0) {
@@ -318,30 +222,37 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       }
     `;
 
-    console.log(`[${triggerTime}] Updating ${updates.length} variants to quantity ${available}`);
-    
-    const input = { 
-      reason: "correction", 
-      setQuantities: updates 
-    };
-    
-    const result = await shopifyGraphQL(mutation, { input });
+    // Split updates into batches to handle large numbers of variants
+    const batches = [];
+    for (let i = 0; i < updates.length; i += syncTracker.batchSize) {
+      batches.push(updates.slice(i, i + syncTracker.batchSize));
+    }
 
-    if (result.inventorySetOnHandQuantities.userErrors.length > 0) {
-      console.error(
-        `[${triggerTime}] Bulk set errors:`,
-        result.inventorySetOnHandQuantities.userErrors
-      );
-    } else {
-      const variantIds = updates.map(u => u.inventoryItemId);
-      console.log(`[${triggerTime}] Successfully updated ${variantIds.length} variants for SKU ${sku} to ${available}`);
+    console.log(`Processing ${batches.length} batches for SKU ${sku}`);
+    let hasErrors = false;
+    const processedVariantIds = new Set();
+
+    // Process each batch
+    for (const batchUpdates of batches) {
+      const input = { reason: "correction", setQuantities: batchUpdates };
+      const result = await shopifyGraphQL(mutation, { input });
       
-      // Record this sync operation to prevent loops
+      if (result.inventorySetOnHandQuantities.userErrors.length > 0) {
+        console.error('Batch update errors:', result.inventorySetOnHandQuantities.userErrors);
+        hasErrors = true;
+      } else {
+        // Track successfully processed variants
+        batchUpdates.forEach(update => processedVariantIds.add(update.inventoryItemId));
+      }
+    }
+
+    if (!hasErrors) {
+      // Only record sync if all batches succeeded
       syncTracker.markSync(
         sku,
         location_id,
         available,
-        variantIds
+        Array.from(processedVariantIds)
       );
 
       console.log(`Synced ${updates.length} variants for SKU ${sku}`);
