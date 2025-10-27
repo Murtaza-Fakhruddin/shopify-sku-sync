@@ -222,37 +222,22 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       }
     `;
 
-    // Split updates into batches to handle large numbers of variants
-    const batches = [];
-    for (let i = 0; i < updates.length; i += syncTracker.batchSize) {
-      batches.push(updates.slice(i, i + syncTracker.batchSize));
-    }
+    const input = { reason: "correction", setQuantities: updates };
 
-    console.log(`Processing ${batches.length} batches for SKU ${sku}`);
-    let hasErrors = false;
-    const processedVariantIds = new Set();
+    const result = await shopifyGraphQL(mutation, { input });
 
-    // Process each batch
-    for (const batchUpdates of batches) {
-      const input = { reason: "correction", setQuantities: batchUpdates };
-      const result = await shopifyGraphQL(mutation, { input });
-      
-      if (result.inventorySetOnHandQuantities.userErrors.length > 0) {
-        console.error('Batch update errors:', result.inventorySetOnHandQuantities.userErrors);
-        hasErrors = true;
-      } else {
-        // Track successfully processed variants
-        batchUpdates.forEach(update => processedVariantIds.add(update.inventoryItemId));
-      }
-    }
-
-    if (!hasErrors) {
-      // Only record sync if all batches succeeded
+    if (result.inventorySetOnHandQuantities.userErrors.length > 0) {
+      console.error(
+        'Bulk set errors:',
+        result.inventorySetOnHandQuantities.userErrors
+      );
+    } else {
+      // Record this sync operation to prevent loops
       syncTracker.markSync(
         sku,
         location_id,
         available,
-        Array.from(processedVariantIds)
+        updates.map(u => u.inventoryItemId)
       );
 
       console.log(`Synced ${updates.length} variants for SKU ${sku}`);
