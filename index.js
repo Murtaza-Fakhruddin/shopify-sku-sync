@@ -2,118 +2,104 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
-const getRawBody = require('raw-body');
+const https = require('https');
 
 const app = express();
 
-// Improved raw body capture with size limits
-app.use((req, res, next) => {
-  // Skip if not a webhook endpoint
-  if (!req.path.startsWith('/webhooks')) {
-    return next();
-  }
-  
-  getRawBody(req, {
-    length: req.headers['content-length'],
-    limit: '1mb' // Add size limit to prevent memory issues
-  })
-    .then(buf => {
-      req.rawBody = buf;
-      try {
-        req.body = JSON.parse(buf.toString('utf8'));
-      } catch (e) {
-        req.body = {};
-      }
-      next();
-    })
-    .catch(err => {
-      console.error('Raw body parsing error:', err);
-      res.status(400).send('Invalid request body');
-    });
-});
+// Use raw body only for Shopify webhook routes
+const rawWebhook = express.raw({ type: 'application/json' });
 
-const SHOP = process.env.SHOPIFY_SHOP;
+// --- Env/config ---
+const SHOP = process.env.SHOPIFY_SHOP; // e.g. mystore.myshopify.com
 const TOKEN = process.env.SHOPIFY_ADMIN_API_ACCESS_TOKEN;
-const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-07';
+const API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-01'; // set to a tested, available version
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-// Improved sync tracker with better memory management
-class SyncTracker {
-  constructor() {
-    this.operations = new Map();
-    this.processingQueue = new Map();
-    this.batchSize = 50;
-    this.timeout = 25000; // 25 seconds (under Render's 30s limit)
-    this.maxMapSize = 1000; // Prevent unlimited growth
-    
-    // Periodic cleanup
-    setInterval(() => this.cleanup(), 60000); // Clean every minute
-  }
+if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
+  console.error('Missing required env variables: SHOPIFY_SHOP, SHOPIFY_ADMIN_API_ACCESS_TOKEN, WEBHOOK_SECRET');
+  process.exit(1);
+}
 
-  cleanup() {
-    const now = Date.now();
-    
-    // Clean operations map
-    for (const [key, value] of this.operations.entries()) {
-      if (now - value.timestamp > this.timeout) {
-        this.operations.delete(key);
+const apiBase = `https://${SHOP}/admin/api/${API_VERSION}`;
+
+// --- HTTP client with keep-alive and timeout ---
+const keepAliveAgent = new https.Agent({ keepAlive: true });
+
+async function shopifyGraphQL(query, variables = {}) {
+  try {
+    const response = await axios.post(
+      `${apiBase}/graphql.json`,
+      { query, variables },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': TOKEN
+        },
+        timeout: 15000,
+        httpsAgent: keepAliveAgent,
+        decompress: true,
+        maxContentLength: 5 * 1024 * 1024
       }
+    );
+
+    if (response.data.errors) {
+      console.error('GraphQL Top-level Errors:', JSON.stringify(response.data.errors, null, 2));
+      throw new Error('GraphQL query failed (top-level errors)');
     }
-    
-    // Clean processing queue
-    for (const [sku, timestamp] of this.processingQueue.entries()) {
-      if (now - timestamp > this.timeout) {
-        this.processingQueue.delete(sku);
-      }
-    }
-    
-    // Emergency cleanup if maps get too large
-    if (this.operations.size > this.maxMapSize) {
-      const entries = Array.from(this.operations.entries());
-      entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-      const toDelete = entries.slice(0, Math.floor(this.maxMapSize / 2));
-      toDelete.forEach(([key]) => this.operations.delete(key));
-    }
+
+    return response.data.data;
+  } catch (error) {
+    const apiErrors = error.response?.data?.errors || error.response?.data || error.message;
+    console.error('GraphQL Error:', apiErrors);
+    throw error;
   }
+}
+
+// --- Verify Shopify HMAC ---
+function verifyWebhook(rawBodyBuffer, hmacHeaderBase64) {
+  if (!hmacHeaderBase64 || !rawBodyBuffer) return false;
+  try {
+    const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBodyBuffer).digest();
+    const provided = Buffer.from(hmacHeaderBase64, 'base64');
+    if (provided.length !== digest.length) return false;
+    return crypto.timingSafeEqual(digest, provided);
+  } catch (e) {
+    console.error('HMAC verification error:', e.message);
+    return false;
+  }
+}
+
+// --- Inventory sync state & locking (in-memory; single-instance safe) ---
+const syncTracker = {
+  operations: new Map(),
+  batchSize: 50,
+  timeout: 30000, // 30s anti-loop window
+  processingQueue: new Map(),
 
   isRecentSync(sku, locationId, quantity) {
     const key = `${sku}:${locationId}:${quantity}`;
     const now = Date.now();
     const syncInfo = this.operations.get(key);
-    
     if (syncInfo && (now - syncInfo.timestamp) < this.timeout) {
-      console.log(`Skipping duplicate sync for SKU ${sku} - Last sync was ${(now - syncInfo.timestamp)/1000}s ago`);
+      console.log(`Skipping duplicate sync for SKU ${sku} - Last sync was ${(now - syncInfo.timestamp) / 1000}s ago`);
       return true;
     }
     return false;
-  }
+  },
 
-  async acquireLock(sku, maxRetries = 3) {
-    for (let i = 0; i < maxRetries; i++) {
-      if (!this.processingQueue.has(sku)) {
-        this.processingQueue.set(sku, Date.now());
-        return true;
-      }
-      
-      // Check if existing lock is stale
-      const lockTime = this.processingQueue.get(sku);
-      if (Date.now() - lockTime > this.timeout) {
-        console.log(`Breaking stale lock for SKU ${sku}`);
-        this.processingQueue.set(sku, Date.now());
-        return true;
-      }
-      
-      if (i < maxRetries - 1) {
-        console.log(`SKU ${sku} is locked, retry ${i + 1}/${maxRetries}`);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
+  async acquireLock(sku) {
+    if (this.processingQueue.has(sku)) {
+      console.log(`SKU ${sku} is already being processed, waiting...`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      return false;
     }
-    return false;
-  }
+    this.processingQueue.set(sku, Date.now());
+    return true;
+  },
 
   releaseLock(sku) {
     this.processingQueue.delete(sku);
-  }
+  },
 
   markSync(sku, locationId, quantity, variantIds) {
     const key = `${sku}:${locationId}:${quantity}`;
@@ -122,92 +108,15 @@ class SyncTracker {
       variantIds: new Set(variantIds)
     });
 
-    // Schedule cleanup
     setTimeout(() => {
       this.operations.delete(key);
-    }, this.timeout).unref(); // unref() prevents keeping process alive
+    }, this.timeout);
 
     console.log(`Marked sync complete for SKU ${sku} with ${variantIds.length} variants`);
   }
-}
+};
 
-const syncTracker = new SyncTracker();
-
-if (!SHOP || !TOKEN || !WEBHOOK_SECRET) {
-  console.error(
-    'Missing required env variables: SHOPIFY_SHOP, SHOPIFY_ADMIN_API_ACCESS_TOKEN, WEBHOOK_SECRET'
-  );
-  process.exit(1);
-}
-
-const apiBase = `https://${SHOP}/admin/api/${API_VERSION}`;
-
-// Verify webhook with better error handling
-function verifyWebhook(req) {
-  try {
-    const hmacHeader = req.headers['x-shopify-hmac-sha256'];
-    if (!hmacHeader || !req.rawBody) return false;
-    
-    const generatedHash = crypto
-      .createHmac('sha256', WEBHOOK_SECRET)
-      .update(req.rawBody)
-      .digest('base64');
-    
-    return crypto.timingSafeEqual(
-      Buffer.from(generatedHash), 
-      Buffer.from(hmacHeader)
-    );
-  } catch (err) {
-    console.error('Webhook verification error:', err);
-    return false;
-  }
-}
-
-// Shopify GraphQL helper with retry logic
-async function shopifyGraphQL(query, variables = {}, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const response = await axios.post(
-        `${apiBase}/graphql.json`,
-        { query, variables },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Shopify-Access-Token': TOKEN
-          },
-          timeout: 10000 // 10 second timeout
-        }
-      );
-
-      if (response.data.errors) {
-        // Check for throttling errors
-        const throttled = response.data.errors.some(e => 
-          e.message?.includes('throttled') || 
-          e.extensions?.code === 'THROTTLED'
-        );
-        
-        if (throttled && i < retries) {
-          console.log(`GraphQL throttled, retry ${i + 1}/${retries}`);
-          await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-          continue;
-        }
-        
-        console.error('GraphQL Errors:', JSON.stringify(response.data.errors, null, 2));
-        throw new Error('GraphQL query failed');
-      }
-
-      return response.data.data;
-    } catch (error) {
-      if (i === retries) {
-        console.error('GraphQL Error after retries:', error.message);
-        throw error;
-      }
-      await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-    }
-  }
-}
-
-// Find variants by SKU with error handling
+// --- Helpers ---
 async function findVariantsBySKU(sku) {
   if (!sku) return [];
   const normalizedSku = String(sku).trim();
@@ -228,21 +137,17 @@ async function findVariantsBySKU(sku) {
     }
   `;
 
-  try {
-    const data = await shopifyGraphQL(query, { sku: `sku:${normalizedSku}` });
-    return data.productVariants.edges.map(e => ({
-      id: e.node.id,
-      sku: e.node.sku,
-      inventory_item_id: e.node.inventoryItem.id
-    }));
-  } catch (err) {
-    console.error(`Failed to find variants for SKU ${sku}:`, err.message);
-    return [];
-  }
+  const data = await shopifyGraphQL(query, { sku: `sku:${normalizedSku}` });
+  const edges = data?.productVariants?.edges || [];
+  return edges.map(e => ({
+    id: e.node.id,
+    sku: e.node.sku,
+    inventory_item_id: e.node.inventoryItem.id // This is a GID
+  }));
 }
 
-// Get inventory item details
-async function getInventoryItem(inventory_item_id) {
+async function getInventoryItem(inventory_item_id_numeric) {
+  if (!inventory_item_id_numeric) return null;
   const query = `
     query($id: ID!) {
       inventoryItem(id: $id) {
@@ -251,160 +156,277 @@ async function getInventoryItem(inventory_item_id) {
       }
     }
   `;
-  
-  try {
-    const data = await shopifyGraphQL(query, {
-      id: `gid://shopify/InventoryItem/${inventory_item_id}`
-    });
-    return data.inventoryItem;
-  } catch (err) {
-    console.error(`Failed to get inventory item ${inventory_item_id}:`, err.message);
-    return null;
+  const variables = { id: `gid://shopify/InventoryItem/${inventory_item_id_numeric}` };
+  const data = await shopifyGraphQL(query, variables);
+  return data?.inventoryItem || null;
+}
+
+function chunk(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+async function setOnHandBatched(updates, reason = 'correction') {
+  const mutation = `
+    mutation setOnHand($input: InventorySetOnHandQuantitiesInput!) {
+      inventorySetOnHandQuantities(input: $input) {
+        inventoryAdjustmentGroup { createdAt }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  for (const part of chunk(updates, syncTracker.batchSize)) {
+    const input = { reason, setQuantities: part };
+    const result = await shopifyGraphQL(mutation, { input });
+    const errs = result?.inventorySetOnHandQuantities?.userErrors || [];
+    if (errs.length) {
+      console.error('SetOnHand userErrors:', errs);
+    }
   }
 }
 
-// Main webhook handler with improved error handling
-app.post('/webhooks/inventory_levels/update', async (req, res) => {
-  const webhookId = crypto.randomUUID();
-  const startTime = Date.now();
-  let lockAcquired = false;
-  let sku = null;
-  
-  try {
-    console.log(`[${webhookId}] Processing webhook at ${new Date().toISOString()}`);
-
-    // Verify webhook
-    if (!verifyWebhook(req)) {
-      console.warn(`[${webhookId}] Webhook verification failed`);
-      return res.status(401).send('Unauthorized');
-    }
-
-    const { inventory_item_id, location_id, available } = req.body;
-    console.log(`[${webhookId}] Webhook data:`, { inventory_item_id, location_id, available });
-
-    // Validate payload
-    if (!inventory_item_id || !location_id || typeof available === 'undefined') {
-      return res.status(400).send('Invalid payload');
-    }
-
-    // Check if we're approaching timeout
-    if (Date.now() - startTime > 20000) {
-      console.warn(`[${webhookId}] Approaching timeout, aborting`);
-      return res.status(200).send('Timeout prevention');
-    }
-
-    // Get SKU
-    const inventoryItem = await getInventoryItem(inventory_item_id);
-    sku = inventoryItem?.sku;
-    
-    if (!sku) {
-      console.log(`[${webhookId}] No SKU found`);
-      return res.status(200).send('No SKU');
-    }
-
-    // Check for recent sync
-    if (syncTracker.isRecentSync(sku, location_id, available)) {
-      return res.status(200).send('Recent sync detected');
-    }
-
-    // Acquire lock
-    lockAcquired = await syncTracker.acquireLock(sku);
-    if (!lockAcquired) {
-      console.log(`[${webhookId}] Could not acquire lock for SKU ${sku}`);
-      return res.status(200).send('SKU locked');
-    }
-
-    // Find variants
-    const variants = await findVariantsBySKU(sku);
-    console.log(`[${webhookId}] Found ${variants.length} variants for SKU ${sku}`);
-
-    if (variants.length <= 1) {
-      return res.status(200).send('No other variants');
-    }
-
-    // Build updates (excluding trigger variant)
-    const locationGid = `gid://shopify/Location/${location_id}`;
-    const updates = variants
-      .filter(v => !v.inventory_item_id.endsWith(`/${inventory_item_id}`))
-      .slice(0, syncTracker.batchSize) // Limit batch size
-      .map(v => ({
-        inventoryItemId: v.inventory_item_id,
-        locationId: locationGid,
-        quantity: available
-      }));
-
-    if (updates.length === 0) {
-      return res.status(200).send('No updates needed');
-    }
-
-    // Check timeout again before mutation
-    if (Date.now() - startTime > 22000) {
-      console.warn(`[${webhookId}] Timeout before mutation`);
-      return res.status(200).send('Timeout prevention');
-    }
-
-    // Execute mutation
-    const mutation = `
-      mutation setOnHand($input: InventorySetOnHandQuantitiesInput!) {
-        inventorySetOnHandQuantities(input: $input) {
-          inventoryAdjustmentGroup {
-            createdAt
-          }
-          userErrors {
-            field
-            message
-          }
-        }
+async function adjustQuantitiesBatched(updates, reason = 'sale') {
+  const mutation = `
+    mutation adjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+      inventoryAdjustQuantities(input: $input) {
+        inventoryAdjustmentGroup { createdAt }
+        userErrors { field message }
       }
-    `;
-
-    const input = { reason: "correction", setQuantities: updates };
-    const result = await shopifyGraphQL(mutation, { input });
-
-    if (result.inventorySetOnHandQuantities?.userErrors?.length > 0) {
-      console.error(`[${webhookId}] Mutation errors:`, 
-        result.inventorySetOnHandQuantities.userErrors);
-    } else {
-      syncTracker.markSync(sku, location_id, available, 
-        updates.map(u => u.inventoryItemId));
-      console.log(`[${webhookId}] Successfully synced ${updates.length} variants`);
     }
+  `;
 
-    const duration = Date.now() - startTime;
-    console.log(`[${webhookId}] Completed in ${duration}ms`);
-    
-    return res.status(200).send('OK');
-
-  } catch (err) {
-    console.error(`[${webhookId}] Error:`, err.message);
-    return res.status(500).send('Error');
-  } finally {
-    if (lockAcquired && sku) {
-      syncTracker.releaseLock(sku);
+  for (const part of chunk(updates, syncTracker.batchSize)) {
+    const input = { reason, adjustQuantities: part };
+    const result = await shopifyGraphQL(mutation, { input });
+    const errs = result?.inventoryAdjustQuantities?.userErrors || [];
+    if (errs.length) {
+      console.error('AdjustQuantities userErrors:', errs);
     }
   }
-});
+}
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    operations: syncTracker.operations.size,
-    queue: syncTracker.processingQueue.size
+// --- Webhook: Inventory Levels Update ---
+app.post('/webhooks/inventory_levels/update', rawWebhook, async (req, res) => {
+  const webhookId = crypto.randomUUID();
+  const topic = req.get('X-Shopify-Topic') || 'inventory_levels/update';
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+
+  // Verify HMAC first
+  const verified = verifyWebhook(req.body, hmacHeader);
+  if (!verified) {
+    console.warn(`[${webhookId}] Webhook verification failed for ${topic}`);
+    return res.status(401).send('Webhook verification failed');
+  }
+
+  // Parse JSON payload
+  let payload = {};
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch (e) {
+    console.warn(`[${webhookId}] Failed to parse webhook body JSON:`, e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+
+  // Ack early to avoid Shopify retries
+  res.status(200).send('OK');
+
+  // Process async
+  process.nextTick(async () => {
+    let lockAcquired = false;
+    let sku;
+
+    try {
+      const { inventory_item_id, location_id, available } = payload || {};
+      console.log(`[${webhookId}] ${topic} payload:`, { inventory_item_id, location_id, available });
+
+      if (!inventory_item_id || !location_id || typeof available === 'undefined') {
+        console.warn(`[${webhookId}] Missing required fields`);
+        return;
+      }
+
+      const inventoryItem = await getInventoryItem(inventory_item_id);
+      sku = inventoryItem?.sku;
+      if (!sku) {
+        console.warn(`[${webhookId}] No SKU found for inventory_item_id ${inventory_item_id}`);
+        return;
+      }
+
+      if (syncTracker.isRecentSync(sku, location_id, available)) {
+        console.log(`[${webhookId}] Skipping - recent sync for ${sku}`);
+        return;
+      }
+
+      // Acquire lock (retry up to 3 times)
+      for (let i = 0; i < 3; i++) {
+        lockAcquired = await syncTracker.acquireLock(sku);
+        if (lockAcquired) break;
+      }
+      if (!lockAcquired) {
+        console.log(`[${webhookId}] Could not acquire lock for SKU ${sku}`);
+        return;
+      }
+
+      console.log(`[${webhookId}] Trigger SKU: ${sku}`);
+
+      const variants = await findVariantsBySKU(sku);
+      console.log(`[${webhookId}] Found ${variants.length} variants for SKU ${sku}`);
+
+      if (!variants || variants.length <= 1) {
+        console.log(`[${webhookId}] No other variants to sync for SKU ${sku}`);
+        return;
+      }
+
+      const locationGid = `gid://shopify/Location/${location_id}`;
+      const updates = variants
+        .filter(v => v.inventory_item_id.split('/').pop() !== String(inventory_item_id))
+        .map(v => ({
+          inventoryItemId: v.inventory_item_id,
+          locationId: locationGid,
+          quantity: available
+        }));
+
+      if (updates.length === 0) {
+        console.log(`[${webhookId}] Nothing to update for SKU ${sku}`);
+        return;
+      }
+
+      await setOnHandBatched(updates, 'correction');
+
+      // Prevent loops for 30s window
+      syncTracker.markSync(sku, location_id, available, updates.map(u => u.inventoryItemId));
+
+      console.log(`[${webhookId}] Synced ${updates.length} variants for SKU ${sku}`);
+    } catch (err) {
+      console.error(`[${webhookId}] Error in inventory_levels/update handler`, err.response?.data || err.message);
+    } finally {
+      if (lockAcquired && sku) {
+        syncTracker.releaseLock(sku);
+        console.log(`[${webhookId}] Released lock for SKU ${sku}`);
+      }
+    }
   });
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    console.log('Server closed');
-    process.exit(0);
+// --- Webhook: Order Created (decrement inventory for all matching SKUs) ---
+app.post('/webhooks/orders/create', rawWebhook, async (req, res) => {
+  const webhookId = crypto.randomUUID();
+  const topic = req.get('X-Shopify-Topic') || 'orders/create';
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+
+  const verified = verifyWebhook(req.body, hmacHeader);
+  if (!verified) {
+    console.warn(`[${webhookId}] Webhook verification failed for ${topic}`);
+    return res.status(401).send('Webhook verification failed');
+  }
+
+  let order = {};
+  try {
+    order = JSON.parse(req.body.toString('utf8'));
+  } catch (e) {
+    console.warn(`[${webhookId}] Failed to parse order webhook JSON:`, e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+
+  res.status(200).send('OK');
+
+  process.nextTick(async () => {
+    try {
+      if (!order || !Array.isArray(order.line_items)) {
+        console.warn(`[${webhookId}] Invalid order payload`);
+        return;
+      }
+
+      for (const item of order.line_items) {
+        const sku = item?.sku;
+        const quantity = item?.quantity;
+        const location_id =
+          order?.location_id ||
+          (Array.isArray(order?.fulfillments) && order.fulfillments[0]?.location_id);
+
+        if (!sku || !location_id || !quantity) {
+          continue;
+        }
+
+        const variants = await findVariantsBySKU(sku);
+        if (!variants || variants.length <= 1) continue;
+
+        const updates = variants.map(v => ({
+          inventoryItemId: v.inventory_item_id,
+          locationId: `gid://shopify/Location/${location_id}`,
+          availableDelta: -Math.abs(quantity)
+        }));
+
+        await adjustQuantitiesBatched(updates, 'sale');
+        console.log(`[${webhookId}] Order sync: decremented ${variants.length} variants for SKU ${sku}`);
+      }
+    } catch (err) {
+      console.error(`[${webhookId}] Error in orders/create handler`, err.response?.data || err.message);
+    }
   });
 });
+
+// --- Webhook: Order Cancelled/Returned (restore inventory for all matching SKUs) ---
+app.post('/webhooks/orders/cancelled', rawWebhook, async (req, res) => {
+  const webhookId = crypto.randomUUID();
+  const topic = req.get('X-Shopify-Topic') || 'orders/cancelled';
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+
+  const verified = verifyWebhook(req.body, hmacHeader);
+  if (!verified) {
+    console.warn(`[${webhookId}] Webhook verification failed for ${topic}`);
+    return res.status(401).send('Webhook verification failed');
+  }
+
+  let order = {};
+  try {
+    order = JSON.parse(req.body.toString('utf8'));
+  } catch (e) {
+    console.warn(`[${webhookId}] Failed to parse order cancelled webhook JSON:`, e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+
+  res.status(200).send('OK');
+
+  process.nextTick(async () => {
+    try {
+      if (!order || !Array.isArray(order.line_items)) {
+        console.warn(`[${webhookId}] Invalid order payload`);
+        return;
+      }
+
+      for (const item of order.line_items) {
+        const sku = item?.sku;
+        const quantity = item?.quantity;
+        const location_id =
+          order?.location_id ||
+          (Array.isArray(order?.fulfillments) && order.fulfillments[0]?.location_id);
+
+        if (!sku || !location_id || !quantity) {
+          continue;
+        }
+
+        const variants = await findVariantsBySKU(sku);
+        if (!variants || variants.length <= 1) continue;
+
+        const updates = variants.map(v => ({
+          inventoryItemId: v.inventory_item_id,
+          locationId: `gid://shopify/Location/${location_id}`,
+          availableDelta: Math.abs(quantity)
+        }));
+
+        await adjustQuantitiesBatched(updates, 'return_or_cancel');
+        console.log(`[${webhookId}] Cancel/return sync: incremented ${variants.length} variants for SKU ${sku}`);
+      }
+    } catch (err) {
+      console.error(`[${webhookId}] Error in orders/cancelled handler`, err.response?.data || err.message);
+    }
+  });
+});
+
+// --- Health endpoint ---
+app.get('/', (req, res) => res.send('Shopify SKU inventory sync app running (GraphQL bulk version)'));
 
 const PORT = process.env.PORT || 10000;
-const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} at ${new Date().toISOString()}`);
-});
+app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
