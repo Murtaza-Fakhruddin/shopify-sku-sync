@@ -203,6 +203,7 @@ function isOrderRelatedUpdate(webhookBody) {
   return hasOrderFields || isOrderTag;
 }
 // --- Webhook handler for inventory level updates ---
+// --- Webhook handler for inventory level updates ---
 app.post('/webhooks/inventory_levels/update', async (req, res) => {
   try {
     if (!verifyWebhook(req)) {
@@ -212,11 +213,13 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
 
     const { inventory_item_id, location_id, available } = req.body;
     console.log('Incoming inventory webhook:', { inventory_item_id, location_id, available });
+    
     // Check if this is an order-related update
     if (isOrderRelatedUpdate(req.body)) {
       console.log('Skipping sync - update is order-related');
       return res.status(200).send('Skipped - order-related update');
     }
+    
     if (!inventory_item_id || !location_id || typeof available === 'undefined') {
       console.warn('Webhook payload missing required fields');
       return res.status(400).send('Bad payload');
@@ -241,7 +244,7 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send(`Skipped - ${source} update, part of recent sync operation`);
     }
 
- // Find all variants with this SKU
+    // Find all variants with this SKU
     const variants = await findVariantsBySKU(sku);
     console.log(`Found ${variants.length} variants for SKU ${sku}`);
 
@@ -259,22 +262,23 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No other variants to update');
     }
 
-   // Update recordSync call to include source
+    // Update recordSync call to include source
     recordSync(sku, location_id, variantsToUpdate.map(v => v.inventory_item_id), source);
 
-    // Build input for GraphQL mutation
+    // Build input for GraphQL mutation - using available inventory
     const locationGid = `gid://shopify/Location/${location_id}`;
-    const updates = variantsToUpdate.map(v => ({
+    const quantities = variantsToUpdate.map(v => ({
       inventoryItemId: v.inventory_item_id,
       locationId: locationGid,
       quantity: available
     }));
 
     const mutation = `
-      mutation setOnHand($input: InventorySetOnHandQuantitiesInput!) {
-        inventorySetOnHandQuantities(input: $input) {
+      mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+        inventorySetQuantities(input: $input) {
           inventoryAdjustmentGroup {
             createdAt
+            reason
           }
           userErrors {
             field
@@ -285,18 +289,20 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
     `;
 
     const input = { 
-      reason: "correction", 
-      setQuantities: updates 
+      reason: "correction",
+      name: "available",  // Set available inventory instead of on-hand
+      ignoreCompareQuantity: true,  // Bypass optimistic locking check
+      quantities: quantities 
     };
 
     const result = await shopifyGraphQL(mutation, { input });
 
-    if (result.inventorySetOnHandQuantities.userErrors.length > 0) {
-      console.error('Bulk set errors:', result.inventorySetOnHandQuantities.userErrors);
+    if (result.inventorySetQuantities.userErrors.length > 0) {
+      console.error('Bulk set errors:', result.inventorySetQuantities.userErrors);
       return res.status(500).send('Failed to sync inventory');
     }
 
-    console.log(`Successfully synced ${updates.length} variants for SKU ${sku}`);
+    console.log(`Successfully synced available inventory for ${quantities.length} variants for SKU ${sku}`);
     return res.status(200).send('Bulk sync complete');
 
   } catch (err) {
@@ -504,8 +510,8 @@ app.post('/webhooks/orders/cancelled', async (req, res) => {
 
 // --- Health endpoint ---
 app.get('/', (req, res) =>
-  res.send('Shopify SKU inventory sync app running (Fixed version)')
+  res.send('Shopify SKU inventory sync app running (Fixed versions)')
 );
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
