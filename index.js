@@ -126,8 +126,19 @@ async function getInventoryItem(inventory_item_id) {
   });
   return data.inventoryItem;
 }
+// Add the detectUpdateSource function
+function detectUpdateSource(webhookBody) {
+  // Check webhook body for signs of order-related updates
+  if (webhookBody.order_id || webhookBody.order_transaction_id) {
+    return 'order';
+  }
+  if (webhookBody.refund_id || webhookBody.restock) {
+    return 'cancel';
+  }
+  return 'manual';
+}
 
-// --- Check if sync should be skipped ---
+// Update the shouldSkipSync function
 function shouldSkipSync(sku, location_id, source = 'manual') {
   const syncKey = `${sku}-${location_id}`;
   
@@ -135,8 +146,11 @@ function shouldSkipSync(sku, location_id, source = 'manual') {
     const syncInfo = recentSyncs.get(syncKey);
     const timeSinceSync = Date.now() - syncInfo.timestamp;
     
-    if (timeSinceSync < SYNC_TIMEOUT) {
-      console.log(`Skipping sync for SKU ${sku} at location ${location_id} - recent sync detected (${timeSinceSync}ms ago)`);
+    // Only skip if:
+    // 1. Recent sync was from a manual update AND current update is also manual
+    // 2. Time window hasn't expired
+    if (syncInfo.source === 'manual' && source === 'manual' && timeSinceSync < SYNC_TIMEOUT) {
+      console.log(`Skipping sync for SKU ${sku} - recent manual sync detected (${timeSinceSync}ms ago)`);
       return true;
     }
   }
@@ -145,7 +159,7 @@ function shouldSkipSync(sku, location_id, source = 'manual') {
 }
 
 // --- Record sync operation ---
-function recordSync(sku, location_id, inventory_item_ids, source = 'manual') {
+function recordSync(sku, location_id, inventory_item_ids, source ) {
   const syncKey = `${sku}-${location_id}`;
   
   recentSyncs.set(syncKey, {
@@ -162,7 +176,32 @@ function recordSync(sku, location_id, inventory_item_ids, source = 'manual') {
     console.log(`Cleared sync record for ${syncKey}`);
   }, SYNC_TIMEOUT);
 }
+// Add this new function after the existing helper functions
+function isOrderRelatedUpdate(webhookBody) {
+  // Check common order-related fields in the webhook payload
+  const orderFields = [
+    'order_id',
+    'order_name',
+    'order_number',
+    'order_transaction_id',
+    'refund_id',
+    'fulfillment_id',
+    'restock'
+  ];
 
+  // Check if any order-related fields exist
+  const hasOrderFields = orderFields.some(field => webhookBody[field]);
+
+  // Also check for order tags or attributes that might indicate order processing
+  const tags = webhookBody.tags || [];
+  const isOrderTag = tags.some(tag => 
+    tag.includes('order') || 
+    tag.includes('fulfillment') || 
+    tag.includes('restock')
+  );
+
+  return hasOrderFields || isOrderTag;
+}
 // --- Webhook handler for inventory level updates ---
 app.post('/webhooks/inventory_levels/update', async (req, res) => {
   try {
@@ -173,7 +212,11 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
 
     const { inventory_item_id, location_id, available } = req.body;
     console.log('Incoming inventory webhook:', { inventory_item_id, location_id, available });
-
+    // Check if this is an order-related update
+    if (isOrderRelatedUpdate(req.body)) {
+      console.log('Skipping sync - update is order-related');
+      return res.status(200).send('Skipped - order-related update');
+    }
     if (!inventory_item_id || !location_id || typeof available === 'undefined') {
       console.warn('Webhook payload missing required fields');
       return res.status(400).send('Bad payload');
@@ -190,12 +233,15 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
 
     console.log('Trigger SKU:', sku);
 
-    // Check if we should skip this sync
-    if (shouldSkipSync(sku, location_id)) {
-      return res.status(200).send('Skipped - part of recent sync operation');
+    // Detect the source of the update
+    const source = detectUpdateSource(req.body);
+    
+    // Check if we should skip this sync with detected source
+    if (shouldSkipSync(sku, location_id, source)) {
+      return res.status(200).send(`Skipped - ${source} update, part of recent sync operation`);
     }
 
-    // Find all variants with this SKU
+ // Find all variants with this SKU
     const variants = await findVariantsBySKU(sku);
     console.log(`Found ${variants.length} variants for SKU ${sku}`);
 
@@ -213,8 +259,8 @@ app.post('/webhooks/inventory_levels/update', async (req, res) => {
       return res.status(200).send('No other variants to update');
     }
 
-    // Record this sync BEFORE making the update
-    recordSync(sku, location_id, variantsToUpdate.map(v => v.inventory_item_id), 'manual');
+   // Update recordSync call to include source
+    recordSync(sku, location_id, variantsToUpdate.map(v => v.inventory_item_id), source);
 
     // Build input for GraphQL mutation
     const locationGid = `gid://shopify/Location/${location_id}`;
